@@ -9,6 +9,9 @@ import torchvision
 import itertools as it
 import json
 import shutil
+import copy
+import numpy as np
+import random
 from pathlib import Path
 
 
@@ -59,20 +62,22 @@ def make_datasets(dataset_name: str) -> tuple[Dataset, Dataset]:
 
 
 def make_model(model_hp: dict) -> nn.Module:
-    name = model_hp["name"]
+    model_hp = copy.deepcopy(model_hp)
+    name = model_hp.pop("name")
     name_to_cls = {"resnet-18": torchvision.models.resnet18}
     cls = name_to_cls[name]
     return cls(**model_hp)
 
 
-def make_optimizer(optimizer_hp: dict) -> optim.Optimizer:
-    name = optimizer_hp["name"]
+def make_optimizer(model: nn.Module, optimizer_hp: dict) -> optim.Optimizer:
+    optimizer_hp = copy.deepcopy(optimizer_hp)
+    name = optimizer_hp.pop("name")
     name_to_cls = {
         "sgd": optim.SGD,
         "adamw": optim.AdamW,
     }
     cls = name_to_cls[name]
-    return cls(**optimizer_hp)
+    return cls(model.parameters(), **optimizer_hp)
 
 
 def make_criterion(dataset_name: str) -> nn.Module:
@@ -98,7 +103,7 @@ def train_epoch(
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
 
-        pred_y = model(y)
+        pred_y = model(x)
         loss = criterion(pred_y, y)
         loss.backward()
         optimizer.step()
@@ -139,7 +144,7 @@ def eval_epoch(
     for x, y in loader:
         x, y = x.to(device), y.to(device)
 
-        pred_y = model(y)
+        pred_y = model(x)
         loss = criterion(pred_y, y)
 
         total_loss += loss.item() * y.size(0)
@@ -177,7 +182,7 @@ class TransformedDataset(Dataset):
 def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
     items = []
     for k, v in d.items():
-        k = f"{parent_key}{sep}{k}"
+        k = f"{parent_key}{sep}{k}" if parent_key else k
         if isinstance(v, dict):
             items.extend(flatten_dict(v, k, sep=sep).items())
         else:
@@ -199,14 +204,21 @@ def unflatten_dict(d: dict, sep=".") -> dict:
 def make_combinations(hps: dict) -> list[dict]:
     flat_hps = flatten_dict(hps)
     keys, values = zip(*flat_hps.items())
-    print(flat_hps)
     return [
         unflatten_dict(dict(zip(keys, combination)))
         for combination in it.product(*values)
     ]
 
 
+def seed(x: int) -> None:
+    torch.random.manual_seed(x)
+    random.seed(x)
+    np.random.seed(x)
+
+
 def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
+    seed(cfg["seed"])
+
     dataset, test_dataset = make_datasets(dataset_name=cfg["dataset_name"])
     train_transform, test_transform = make_transforms(dataset_name=cfg["dataset_name"])
     criterion = make_criterion(dataset_name=cfg["dataset_name"])
@@ -215,13 +227,12 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
     idx = list(range(len(dataset)))
     y = [y for _, y in dataset]
     folds = list(kfold.split(idx, y))
-    print(folds)
 
     hps = make_combinations(cfg["hps"])
-    print(hps)
     sweep = {"hps": [], "best_hp": {}}
     best_hp_idx = 0
-    for i, hp in enumerate(hps):
+    for hp_idx, hp in enumerate(hps):
+        print(f"[Model {hp_idx + 1}/{len(hps)}] hp = {hp}")
         sweep["hps"].append(
             {
                 "hp": hp,
@@ -231,7 +242,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
                 "val_acc": [],
             }
         )
-        for train_idx, val_idx in folds:
+        for fold_idx, (train_idx, val_idx) in enumerate(folds):
             train_dataset = TransformedDataset(
                 Subset(dataset, train_idx), train_transform
             )
@@ -241,7 +252,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             val_loader = DataLoader(val_dataset, batch_size=hp["batch_size"])
 
             model = make_model(model_hp=hp["model"])
-            optimizer = make_optimizer(optimizer_hp=hp["optimizer"])
+            optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
 
             train_avg_losses, train_accs = train(
                 model=model,
@@ -253,6 +264,9 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             val_loss, val_acc = eval(
                 model=model, criterion=criterion, loader=val_loader
             )
+            print(
+                f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}"
+            )
 
             sweep["hps"][-1]["train_avg_losses"].append(train_avg_losses)
             sweep["hps"][-1]["train_accs"].append(train_accs)
@@ -262,7 +276,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             avg_val_acc = torch.mean(sweep["hps"][-1]["val_acc"])
             best_avg_val_acc = torch.mean(sweep["hps"][best_hp_idx]["val_acc"])
             if avg_val_acc > best_avg_val_acc:
-                best_hp_idx = i
+                best_hp_idx = hp_idx
 
     best_hp = sweep["hps"][best_hp_idx]["hp"]
 
@@ -273,7 +287,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
     test_loader = DataLoader(test_dataset, batch_size=best_hp["batch_size"])
 
     model = make_model(model_hp=best_hp["model"])
-    optimizer = make_optimizer(optimizer_hp=best_hp["optimizer"])
+    optimizer = make_optimizer(model, optimizer_hp=best_hp["optimizer"])
 
     train_avg_losses, train_accs = train(
         model=model,
@@ -283,6 +297,9 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
         max_epochs=best_hp["max_epochs"],
     )
     test_loss, test_acc = eval(model=model, criterion=criterion, loader=test_loader)
+    print(
+        f"[Best Model] hp = {best_hp}, test_loss = {test_loss}, test_acc = {test_acc}"
+    )
 
     sweep["best_hp"] = {
         "best_hp_idx": best_hp_idx,
@@ -306,7 +323,6 @@ def main():
 
     if args.clean and result_path.exists():
         shutil.rmtree(result_path)
-        return
 
     result_path.mkdir()
 

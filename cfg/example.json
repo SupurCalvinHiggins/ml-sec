@@ -4,13 +4,13 @@
   "n_splits": 5,
   "hps": {
     "model": {
-      "name": ["resnet-18"],
-      "batch_size": [32]
+      "name": ["resnet-18"]
     },
     "optimizer": {
       "name": ["sgd"],
-      "learning_rate": [0.001]
+      "lr": [0.001, 0.0001]
     },
-    "max_epochs": 100
+    "max_epochs": [1, 2],
+    "batch_size": [256]
   }
 }
