@@ -8,9 +8,9 @@
     },
     "optimizer": {
       "name": ["sgd"],
-      "lr": [0.001, 0.0001]
+      "lr": [0.01, 0.0001]
     },
-    "max_epochs": [1, 2],
+    "max_epochs": [10],
     "batch_size": [256]
   }
 }

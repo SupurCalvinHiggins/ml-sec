@@ -44,8 +44,8 @@ def make_transforms(dataset_name: str):
     test_transform = transforms.Compose([transforms.ToTensor(), normalize_transform])
     train_transform = transforms.Compose(
         [
-            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
-            transforms.RandomHorizontalFlip(),
+            # transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize_transform,
         ]
@@ -211,7 +211,7 @@ def make_combinations(hps: dict) -> list[dict]:
 
 
 def seed(x: int) -> None:
-    torch.random.manual_seed(x)
+    torch.manual_seed(x)
     random.seed(x)
     np.random.seed(x)
 
@@ -221,7 +221,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
 
     dataset, test_dataset = make_datasets(dataset_name=cfg["dataset_name"])
     train_transform, test_transform = make_transforms(dataset_name=cfg["dataset_name"])
-    criterion = make_criterion(dataset_name=cfg["dataset_name"])
+    criterion = make_criterion(dataset_name=cfg["dataset_name"]).to(device)
 
     kfold = StratifiedKFold(n_splits=cfg["n_splits"], shuffle=True)
     idx = list(range(len(dataset)))
@@ -246,12 +246,12 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             train_dataset = TransformedDataset(
                 Subset(dataset, train_idx), train_transform
             )
-            train_loader = DataLoader(train_dataset, batch_size=hp["batch_size"])
+            train_loader = DataLoader(train_dataset, batch_size=hp["batch_size"], pin_memory=True, num_workers=4)
 
             val_dataset = TransformedDataset(Subset(dataset, val_idx), test_transform)
             val_loader = DataLoader(val_dataset, batch_size=hp["batch_size"])
 
-            model = make_model(model_hp=hp["model"])
+            model = make_model(model_hp=hp["model"]).to(device)
             optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
 
             train_avg_losses, train_accs = train(
@@ -273,10 +273,10 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             sweep["hps"][-1]["val_loss"].append(val_loss)
             sweep["hps"][-1]["val_acc"].append(val_acc)
 
-            avg_val_acc = torch.mean(sweep["hps"][-1]["val_acc"])
-            best_avg_val_acc = torch.mean(sweep["hps"][best_hp_idx]["val_acc"])
-            if avg_val_acc > best_avg_val_acc:
-                best_hp_idx = hp_idx
+        avg_val_acc = np.mean(sweep["hps"][-1]["val_acc"])
+        best_avg_val_acc = np.mean(sweep["hps"][best_hp_idx]["val_acc"])
+        if avg_val_acc > best_avg_val_acc:
+            best_hp_idx = hp_idx
 
     best_hp = sweep["hps"][best_hp_idx]["hp"]
 
@@ -286,7 +286,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
     test_dataset = TransformedDataset(test_dataset, test_transform)
     test_loader = DataLoader(test_dataset, batch_size=best_hp["batch_size"])
 
-    model = make_model(model_hp=best_hp["model"])
+    model = make_model(model_hp=best_hp["model"]).to(device)
     optimizer = make_optimizer(model, optimizer_hp=best_hp["optimizer"])
 
     train_avg_losses, train_accs = train(
