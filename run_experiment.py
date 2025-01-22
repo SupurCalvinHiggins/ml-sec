@@ -7,17 +7,18 @@ from torch import optim
 import torch
 import torchvision
 import itertools as it
+import json
+import shutil
+from pathlib import Path
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def make_parser():
+def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dataset_name", default="cifar-10", choices=["cifar-10", "cifar-100"]
-    )
-    parser.add_argument("--model_name", default="resnet-18", choices=["resnet-18"])
+    parser.add_argument("cfg_path", type=Path)
+    parser.add_argument("--clean", default=False, action="store_true")
     return parser
 
 
@@ -185,34 +186,52 @@ def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
 
 
 def unflatten_dict(d: dict, sep=".") -> dict:
-    result = {}
+    sweep = {}
     for k, v in d.items():
         keys = k.split(sep)
-        d = result
+        d = sweep
         for key in keys[:-1]:
             d = d.setdefault(key, {})
         d[keys[-1]] = v
-    return result
+    return sweep
 
 
 def make_combinations(hps: dict) -> list[dict]:
     flat_hps = flatten_dict(hps)
     keys, values = zip(*flat_hps.items())
+    print(flat_hps)
     return [
         unflatten_dict(dict(zip(keys, combination)))
         for combination in it.product(*values)
     ]
 
 
-def cv_main(cfg):
+def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
     dataset, test_dataset = make_datasets(dataset_name=cfg["dataset_name"])
     train_transform, test_transform = make_transforms(dataset_name=cfg["dataset_name"])
     criterion = make_criterion(dataset_name=cfg["dataset_name"])
 
+    kfold = StratifiedKFold(n_splits=cfg["n_splits"], shuffle=True)
+    idx = list(range(len(dataset)))
+    y = [y for _, y in dataset]
+    folds = list(kfold.split(idx, y))
+    print(folds)
+
     hps = make_combinations(cfg["hps"])
-    kfold = StratifiedKFold(shuffle=True)
-    for hp in hps:
-        for i, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
+    print(hps)
+    sweep = {"hps": [], "best_hp": {}}
+    best_hp_idx = 0
+    for i, hp in enumerate(hps):
+        sweep["hps"].append(
+            {
+                "hp": hp,
+                "train_avg_losses": [],
+                "train_accs": [],
+                "val_loss": [],
+                "val_acc": [],
+            }
+        )
+        for train_idx, val_idx in folds:
             train_dataset = TransformedDataset(
                 Subset(dataset, train_idx), train_transform
             )
@@ -235,15 +254,70 @@ def cv_main(cfg):
                 model=model, criterion=criterion, loader=val_loader
             )
 
+            sweep["hps"][-1]["train_avg_losses"].append(train_avg_losses)
+            sweep["hps"][-1]["train_accs"].append(train_accs)
+            sweep["hps"][-1]["val_loss"].append(val_loss)
+            sweep["hps"][-1]["val_acc"].append(val_acc)
+
+            avg_val_acc = torch.mean(sweep["hps"][-1]["val_acc"])
+            best_avg_val_acc = torch.mean(sweep["hps"][best_hp_idx]["val_acc"])
+            if avg_val_acc > best_avg_val_acc:
+                best_hp_idx = i
+
+    best_hp = sweep["hps"][best_hp_idx]["hp"]
+
+    train_dataset = TransformedDataset(dataset, train_transform)
+    train_loader = DataLoader(train_dataset, batch_size=best_hp["batch_size"])
+
     test_dataset = TransformedDataset(test_dataset, test_transform)
-    test_loader = DataLoader(test_dataset)
+    test_loader = DataLoader(test_dataset, batch_size=best_hp["batch_size"])
+
+    model = make_model(model_hp=best_hp["model"])
+    optimizer = make_optimizer(optimizer_hp=best_hp["optimizer"])
+
+    train_avg_losses, train_accs = train(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        loader=train_loader,
+        max_epochs=best_hp["max_epochs"],
+    )
+    test_loss, test_acc = eval(model=model, criterion=criterion, loader=test_loader)
+
+    sweep["best_hp"] = {
+        "best_hp_idx": best_hp_idx,
+        "hp": sweep["hps"][best_hp_idx]["hp"],
+        "train_avg_losses": train_avg_losses,
+        "train_accs": train_accs,
+        "test_loss": test_loss,
+        "test_acc": test_acc,
+    }
+
+    return model, sweep
 
 
 def main():
     parser = make_parser()
     args = parser.parse_args()
-    cfg = {}
-    cv_main(cfg)
+    assert args.cfg_path.exists()
+    result_path = args.cfg_path.parent / args.cfg_path.stem
+    if not args.clean and result_path.exists():
+        return
+
+    if args.clean and result_path.exists():
+        shutil.rmtree(result_path)
+        return
+
+    result_path.mkdir()
+
+    cfg = json.loads(args.cfg_path.read_text())
+    model, sweep = cv_main(cfg)
+
+    model_path = result_path / "model.pth"
+    sweep_path = result_path / "sweep.json"
+
+    torch.save(model.state_dict(), model_path)
+    sweep_path.write_text(json.dumps(sweep))
 
 
 if __name__ == "__main__":

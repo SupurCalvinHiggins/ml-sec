@@ -1,6 +1,7 @@
 {
   "dataset_name": "cifar-10",
   "seed": 0,
+  "n_splits": 5,
   "hps": {
     "model": {
       "name": ["resnet-18"],
