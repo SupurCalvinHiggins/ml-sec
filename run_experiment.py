@@ -36,7 +36,7 @@ def make_normalize_transform(dataset_name: str):
         "cifar-100": (0.2673, 0.2564, 0.2762),
     }
     return transforms.Normalize(
-        dataset_name_to_mean[dataset_name], dataset_name_to_std[dataset_name]
+        dataset_name_to_mean[dataset_name], dataset_name_to_std[dataset_name], inplace=True
     )
 
 
@@ -96,26 +96,39 @@ def train_epoch(
     criterion: nn.Module,
     loader: DataLoader,
 ) -> tuple[float, float]:
-    total_loss = 0.0
-    correct = 0
-    total = 0
+    total_loss = torch.tensor(0.0, device=device, requires_grad=False)
+    total_correct = torch.tensor(0, device=device, requires_grad=False)
+    total_samples = 0
+
+    use_amp = True
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
-        pred_y = model(x)
-        loss = criterion(pred_y, y)
-        loss.backward()
-        optimizer.step()
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            pred_y = model(x)
+            loss = criterion(pred_y, y)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        total_loss += loss.item() * y.size(0)
-        correct += (pred_y.argmax(dim=1) == y).sum().item()
-        total += y.size(0)
+        loss = loss.detach()
+        pred_y = pred_y.detach()
 
-    acc = correct / total
-    avg_loss = total_loss / total
-    return avg_loss, acc
+        total_loss += loss
+        total_correct += (pred_y.argmax(dim=1) == y).sum()
+        total_samples += y.size(0)
+
+    # total_loss = total_loss.item()
+    # total_correct = total_correct.item()
+
+    # acc = total_correct / total_samples
+    # avg_loss = total_loss / total_samples
+    
+    # return avg_loss, acc
+    return 0.0, 0.0
 
 
 @torch.enable_grad()
@@ -251,7 +264,8 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
                 train_dataset,
                 batch_size=hp["batch_size"],
                 pin_memory=True,
-                num_workers=4,
+                num_workers=12,
+                persistent_workers=True,
             )
 
             val_dataset = TransformedDataset(Subset(dataset, val_idx), test_transform)
@@ -274,7 +288,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
                 model=model, criterion=criterion, loader=val_loader
             )
             print(
-                f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}, time = {train_time}"
+                    f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}, time = {train_time:.2f}"
             )
 
             sweep["hps"][-1]["train_avg_losses"].append(train_avg_losses)
