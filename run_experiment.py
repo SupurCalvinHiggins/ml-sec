@@ -12,6 +12,7 @@ import shutil
 import copy
 import numpy as np
 import random
+import time
 from pathlib import Path
 
 
@@ -246,7 +247,12 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             train_dataset = TransformedDataset(
                 Subset(dataset, train_idx), train_transform
             )
-            train_loader = DataLoader(train_dataset, batch_size=hp["batch_size"], pin_memory=True, num_workers=4)
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=hp["batch_size"],
+                pin_memory=True,
+                num_workers=4,
+            )
 
             val_dataset = TransformedDataset(Subset(dataset, val_idx), test_transform)
             val_loader = DataLoader(val_dataset, batch_size=hp["batch_size"])
@@ -254,6 +260,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             model = make_model(model_hp=hp["model"]).to(device)
             optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
 
+            train_start = time.time()
             train_avg_losses, train_accs = train(
                 model=model,
                 optimizer=optimizer,
@@ -261,11 +268,13 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
                 loader=train_loader,
                 max_epochs=hp["max_epochs"],
             )
+            train_end = time.time()
+            train_time = train_end - train_start
             val_loss, val_acc = eval(
                 model=model, criterion=criterion, loader=val_loader
             )
             print(
-                f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}"
+                f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}, time = {train_time}"
             )
 
             sweep["hps"][-1]["train_avg_losses"].append(train_avg_losses)
