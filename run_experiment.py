@@ -30,8 +30,8 @@ def make_parser() -> argparse.ArgumentParser:
 
 class ImageDataset(Dataset):
     def __init__(self, data, targets, device=None):
-        self.data = torch.tensor(data, device=device)
-        self.targets = torch.tensor(targets, device=device)
+        self.data = data.to(device)
+        self.targets = targets.to(device)
         self.device = device
 
     def subset(self, indices: list[int]):
@@ -85,8 +85,13 @@ def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
     train_dataset = cls(root="./data", train=True, download=True)
     test_dataset = cls(root="./data", train=False, download=False)
 
-    train_data, train_targets = zip(*list(train_dataset))
-    test_data, test_targets = zip(*list(test_dataset))
+    transform = transforms.ToTensor()
+
+    train_data, train_targets = zip(*[(transform(img), target) for img, target in train_dataset])
+    test_data, test_targets = zip(*[(transform(img), target) for img, target in test_dataset])
+
+    train_data, train_targets = torch.stack(train_data), torch.tensor(train_targets)
+    test_data, test_targets = torch.stack(test_data), torch.tensor(test_targets)
 
     train_dataset = ImageDataset(train_data, train_targets, device=device)
     test_dataset = ImageDataset(test_data, test_targets, device=device)
@@ -136,7 +141,6 @@ def train_epoch(
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     for x, y in loader:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
@@ -153,14 +157,14 @@ def train_epoch(
         total_correct += (pred_y.argmax(dim=1) == y).sum()
         total_samples += y.size(0)
 
-    # total_loss = total_loss.item()
-    # total_correct = total_correct.item()
+    # return 0.0, 0.0
+    total_loss = total_loss.item()
+    total_correct = total_correct.item()
 
-    # acc = total_correct / total_samples
-    # avg_loss = total_loss / total_samples
+    acc = total_correct / total_samples
+    avg_loss = total_loss / total_samples
 
-    # return avg_loss, acc
-    return 0.0, 0.0
+    return avg_loss, acc
 
 
 @torch.enable_grad()
@@ -188,8 +192,6 @@ def eval_epoch(
     total = 0
 
     for x, y in loader:
-        x, y = x.to(device), y.to(device)
-
         pred_y = model(x)
         loss = criterion(pred_y, y)
 
@@ -256,8 +258,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
 
     kfold = StratifiedKFold(n_splits=cfg["n_splits"], shuffle=True)
     idx = list(range(len(dataset)))
-    y = [y for _, y in dataset]
-    folds = list(kfold.split(idx, y))
+    folds = list(kfold.split(idx, dataset.targets.cpu()))
 
     hps = make_combinations(cfg["hps"])
     sweep = {"hps": [], "best_hp": {}}
@@ -278,9 +279,6 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=hp["batch_size"],
-                pin_memory=True,
-                num_workers=12,
-                persistent_workers=True,
             )
 
             val_dataset = dataset.subset(val_idx).transform_(test_transform)
