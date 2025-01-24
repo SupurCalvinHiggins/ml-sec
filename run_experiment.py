@@ -1,9 +1,10 @@
 import argparse
 from sklearn.model_selection import StratifiedKFold
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms, datasets
 from torch import nn
 from torch import optim
+from torch import Tensor
 import torch
 import torchvision
 import itertools as it
@@ -12,6 +13,7 @@ import shutil
 import copy
 import numpy as np
 import random
+import kornia
 import time
 from pathlib import Path
 
@@ -26,6 +28,28 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class ImageDataset(Dataset):
+    def __init__(self, data, targets, device=None):
+        self.data = torch.tensor(data, device=device)
+        self.targets = torch.tensor(targets, device=device)
+        self.device = device
+
+    def subset(self, indices: list[int]):
+        data, targets = self.data[indices], self.targets[indices]
+        return ImageDataset(data, targets, device=self.device)
+
+    def transform_(self, transform):
+        self.data = transform(self.data)
+        return self
+
+    def __getitem__(self, index: int):
+        img, target = self.data[index], self.targets[index]
+        return img, target
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+
 def make_normalize_transform(dataset_name: str):
     dataset_name_to_mean = {
         "cifar-10": (0.4914, 0.4822, 0.4465),
@@ -35,30 +59,38 @@ def make_normalize_transform(dataset_name: str):
         "cifar-10": (0.2471, 0.2435, 0.2616),
         "cifar-100": (0.2673, 0.2564, 0.2762),
     }
-    return transforms.Normalize(
-        dataset_name_to_mean[dataset_name], dataset_name_to_std[dataset_name], inplace=True
+    return kornia.augmentation.Normalize(
+        dataset_name_to_mean[dataset_name],
+        dataset_name_to_std[dataset_name],
     )
 
 
 def make_transforms(dataset_name: str):
     normalize_transform = make_normalize_transform(dataset_name)
-    test_transform = transforms.Compose([transforms.ToTensor(), normalize_transform])
-    train_transform = transforms.Compose(
-        [
-            # transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
-            # transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize_transform,
-        ]
-    )
-    return train_transform, test_transform
+    # test_transform = transforms.Compose([transforms.ToTensor(), normalize_transform])
+    # train_transform = transforms.Compose(
+    #     [
+    #       # transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+    #        # transforms.RandomHorizontalFlip(),
+    #        transforms.ToTensor(),
+    #        normalize_transform,
+    #    ]
+    # )
+    return normalize_transform, normalize_transform
 
 
-def make_datasets(dataset_name: str) -> tuple[Dataset, Dataset]:
+def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
     dataset_name_to_cls = {"cifar-10": datasets.CIFAR10, "cifar-100": datasets.CIFAR100}
     cls = dataset_name_to_cls[dataset_name]
     train_dataset = cls(root="./data", train=True, download=True)
     test_dataset = cls(root="./data", train=False, download=False)
+
+    train_data, train_targets = zip(*list(train_dataset))
+    test_data, test_targets = zip(*list(test_dataset))
+
+    train_dataset = ImageDataset(train_data, train_targets, device=device)
+    test_dataset = ImageDataset(test_data, test_targets, device=device)
+
     return train_dataset, test_dataset
 
 
@@ -126,7 +158,7 @@ def train_epoch(
 
     # acc = total_correct / total_samples
     # avg_loss = total_loss / total_samples
-    
+
     # return avg_loss, acc
     return 0.0, 0.0
 
@@ -176,21 +208,6 @@ def eval(
 ) -> tuple[float, float]:
     model.eval()
     return eval_epoch(model, criterion, loader)
-
-
-class TransformedDataset(Dataset):
-    def __init__(self, dataset: Dataset, transform):
-        self.dataset = dataset
-        self.transform = transform
-
-    def __getitem__(self, index):
-        x, y = self.dataset[index]
-        if self.transform is not None:
-            x = self.transform(x)
-        return x, y
-
-    def __len__(self):
-        return len(self.dataset)
 
 
 def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
@@ -257,9 +274,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             }
         )
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
-            train_dataset = TransformedDataset(
-                Subset(dataset, train_idx), train_transform
-            )
+            train_dataset = dataset.subset(train_idx).transform_(train_transform)
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=hp["batch_size"],
@@ -268,7 +283,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
                 persistent_workers=True,
             )
 
-            val_dataset = TransformedDataset(Subset(dataset, val_idx), test_transform)
+            val_dataset = dataset.subset(val_idx).transform_(test_transform)
             val_loader = DataLoader(val_dataset, batch_size=hp["batch_size"])
 
             model = make_model(model_hp=hp["model"]).to(device)
@@ -288,7 +303,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
                 model=model, criterion=criterion, loader=val_loader
             )
             print(
-                    f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}, time = {train_time:.2f}"
+                f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}, time = {train_time:.2f}"
             )
 
             sweep["hps"][-1]["train_avg_losses"].append(train_avg_losses)
@@ -303,10 +318,10 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
 
     best_hp = sweep["hps"][best_hp_idx]["hp"]
 
-    train_dataset = TransformedDataset(dataset, train_transform)
+    train_dataset = dataset.transform_(train_transform)
     train_loader = DataLoader(train_dataset, batch_size=best_hp["batch_size"])
 
-    test_dataset = TransformedDataset(test_dataset, test_transform)
+    test_dataset = test_dataset.transform_(test_transform)
     test_loader = DataLoader(test_dataset, batch_size=best_hp["batch_size"])
 
     model = make_model(model_hp=best_hp["model"]).to(device)
