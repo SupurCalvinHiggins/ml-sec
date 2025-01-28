@@ -146,20 +146,23 @@ def train_epoch(
     scaler = torch.amp.GradScaler("cuda", enabled=not debug)
 
     prof = torch.profiler.profile(
-        schedule=torch.profiler.schedule(wait=1, warmup=5, active=3, repeat=1),
+        schedule=torch.profiler.schedule(wait=5, warmup=5, active=3, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/resnet18"),
-        record_shapes=True,
         with_stack=True,
     ) if profile else contextlib.nullcontext()
 
     with prof:
-        for x, y in loader:
+        dataset = loader.dataset
+        for i in range(0, len(dataset.data), loader.batch_size):
+            x = dataset.data[i:i+loader.batch_size]
+            y = dataset.targets[i:i+loader.batch_size]
             if profile:
                 prof.step()
 
             if transform is not None:
                 with torch.no_grad():
                     x = transform(x)
+            x = x.to(memory_format=torch.channels_last)
                 
             optimizer.zero_grad(set_to_none=True)
 
@@ -200,7 +203,7 @@ def train(
     model.train()
     avg_losses, accs = [], []
     for _ in range(max_epochs):
-        avg_loss, acc = train_epoch(model, optimizer, criterion, loader, transform=transform, debug=debug)
+        avg_loss, acc = train_epoch(model, optimizer, criterion, loader, transform=transform, debug=debug, profile=profile)
         avg_losses.append(avg_loss)
         accs.append(acc)
     return avg_losses, accs
@@ -217,6 +220,7 @@ def eval_epoch(
     total_samples = 0
 
     for x, y in loader:
+        x = x.to(memory_format=torch.channels_last)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=not debug):
             pred_y = model(x)
             loss = criterion(pred_y, y)
@@ -300,6 +304,8 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
     idx = list(range(len(dataset)))
     folds = list(kfold.split(idx, dataset.targets.cpu()))
 
+    torch.backends.cudnn.benchmark = True
+
     hps = make_combinations(cfg["hps"])
     sweep = {"hps": [], "best_hp": {}}
     best_hp_idx = 0
@@ -315,7 +321,8 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
             }
         )
         
-        model = make_model(model_hp=hp["model"]).to(device)
+        model = make_model(model_hp=hp["model"]).to(device, memory_format=torch.channels_last)
+        torch.compile(model, mode="max-autotune")
         optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
@@ -325,6 +332,7 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=hp["batch_size"],
+                shuffle=True,
             )
 
             val_dataset = dataset.subset(val_idx).transform_(test_transform)
@@ -366,7 +374,7 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
     best_hp = sweep["hps"][best_hp_idx]["hp"]
 
     train_dataset = dataset
-    train_loader = DataLoader(train_dataset, batch_size=best_hp["batch_size"])
+    train_loader = DataLoader(train_dataset, batch_size=best_hp["batch_size"], shuffle=True)
 
     test_dataset = test_dataset.transform_(test_transform)
     test_loader = DataLoader(test_dataset, batch_size=best_hp["batch_size"])
