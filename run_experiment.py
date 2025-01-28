@@ -203,10 +203,7 @@ def train_epoch(
     )
 
     with prof:
-        dataset = loader.dataset
-        for i in range(0, len(dataset.data), loader.batch_size):
-            x = dataset.data[i : i + loader.batch_size]
-            y = dataset.targets[i : i + loader.batch_size]
+        for x, y in loader:
             if profile:
                 prof.step()
 
