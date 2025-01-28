@@ -1,7 +1,8 @@
 import argparse
+import math
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms, datasets
+from torchvision import datasets
 from torch import nn
 from torch import optim
 from torch import Tensor
@@ -41,7 +42,15 @@ class ImageDataset(Dataset):
         data, targets = self.data[indices], self.targets[indices]
         return ImageDataset(data, targets, device=self.device)
 
+    def slice(self, start: int, end: int):
+        imgs, targets = self.data[start:end], self.targets[start:end]
+        return imgs, targets
+
     def transform_(self, transform):
+        self.data, self.targets = transform(self.data, self.targets)
+        return self
+
+    def transform_data_(self, transform):
         self.data = transform(self.data)
         return self
 
@@ -51,6 +60,36 @@ class ImageDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.data)
+
+
+class ImageDataLoader:
+    def __init__(self, dataset: ImageDataset, batch_size: int, shuffle: bool = False):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        self._idx = 0
+
+    def __iter__(self):
+        self._idx = 0
+
+        if self.shuffle:
+
+            @torch.no_grad()
+            def shuffle_transform(data, targets):
+                idx = torch.randperm(len(data), device=data.device)
+                return data[idx], targets[idx]
+
+            self.dataset.transform_(shuffle_transform)
+
+        return self
+
+    def __next__(self):
+        if self._idx >= len(self.dataset):
+            raise StopIteration
+        imgs, targets = self.dataset.slice(self._idx, self._idx + self.batch_size)
+        self._idx += self.batch_size
+        return imgs, targets
 
 
 def make_transforms(dataset_name: str):
@@ -63,20 +102,24 @@ def make_transforms(dataset_name: str):
         "cifar-100": (0.2673, 0.2564, 0.2762),
     }
 
-    test_transform = v2.Compose([
-        v2.ToDtype(torch.float32, scale=True),
-        v2.Normalize(
-            dataset_name_to_mean[dataset_name],
-            dataset_name_to_std[dataset_name],
-        )
-    ]) 
-    train_transform = v2.Compose([
-        v2.RandomCrop(32, padding=4, padding_mode="reflect"),
-        v2.RandomHorizontalFlip(),
-        test_transform,
-    ])
-    
-    return train_transform, test_transform 
+    test_transform = v2.Compose(
+        [
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(
+                dataset_name_to_mean[dataset_name],
+                dataset_name_to_std[dataset_name],
+            ),
+        ]
+    )
+    train_transform = v2.Compose(
+        [
+            v2.RandomCrop(32, padding=4, padding_mode="reflect"),
+            v2.RandomHorizontalFlip(),
+            test_transform,
+        ]
+    )
+
+    return train_transform, test_transform
 
 
 def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
@@ -87,8 +130,12 @@ def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
 
     transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.uint8, scale=True)])
 
-    train_data, train_targets = zip(*[(transform(img), target) for img, target in train_dataset])
-    test_data, test_targets = zip(*[(transform(img), target) for img, target in test_dataset])
+    train_data, train_targets = zip(
+        *[(transform(img), target) for img, target in train_dataset]
+    )
+    test_data, test_targets = zip(
+        *[(transform(img), target) for img, target in test_dataset]
+    )
 
     train_data, train_targets = torch.stack(train_data), torch.tensor(train_targets)
     test_data, test_targets = torch.stack(test_data), torch.tensor(test_targets)
@@ -133,7 +180,7 @@ def train_epoch(
     optimizer: optim.Optimizer,
     criterion: nn.Module,
     loader: DataLoader,
-    transform = None,
+    transform=None,
     debug: bool = False,
     profile: bool = False,
 ) -> tuple[float, float]:
@@ -145,17 +192,21 @@ def train_epoch(
 
     scaler = torch.amp.GradScaler("cuda", enabled=not debug)
 
-    prof = torch.profiler.profile(
-        schedule=torch.profiler.schedule(wait=5, warmup=5, active=3, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/resnet18"),
-        with_stack=True,
-    ) if profile else contextlib.nullcontext()
+    prof = (
+        torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=5, warmup=5, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/resnet18"),
+            with_stack=True,
+        )
+        if profile
+        else contextlib.nullcontext()
+    )
 
     with prof:
         dataset = loader.dataset
         for i in range(0, len(dataset.data), loader.batch_size):
-            x = dataset.data[i:i+loader.batch_size]
-            y = dataset.targets[i:i+loader.batch_size]
+            x = dataset.data[i : i + loader.batch_size]
+            y = dataset.targets[i : i + loader.batch_size]
             if profile:
                 prof.step()
 
@@ -163,10 +214,12 @@ def train_epoch(
                 with torch.no_grad():
                     x = transform(x)
             x = x.to(memory_format=torch.channels_last)
-                
+
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=not debug):
+            with torch.autocast(
+                device_type="cuda", dtype=torch.float16, enabled=not debug
+            ):
                 pred_y = model(x)
                 loss = criterion(pred_y, y)
             scaler.scale(loss).backward()
@@ -196,14 +249,22 @@ def train(
     criterion: nn.Module,
     loader: DataLoader,
     max_epochs: int,
-    transform = None,
+    transform=None,
     debug: bool = False,
     profile: bool = False,
 ) -> tuple[list[float], list[float]]:
     model.train()
     avg_losses, accs = [], []
     for _ in range(max_epochs):
-        avg_loss, acc = train_epoch(model, optimizer, criterion, loader, transform=transform, debug=debug, profile=profile)
+        avg_loss, acc = train_epoch(
+            model,
+            optimizer,
+            criterion,
+            loader,
+            transform=transform,
+            debug=debug,
+            profile=profile,
+        )
         avg_losses.append(avg_loss)
         accs.append(acc)
     return avg_losses, accs
@@ -211,7 +272,10 @@ def train(
 
 @torch.no_grad()
 def eval_epoch(
-        model: nn.Module, criterion: nn.Module, loader: DataLoader, debug: bool = False,
+    model: nn.Module,
+    criterion: nn.Module,
+    loader: DataLoader,
+    debug: bool = False,
 ) -> tuple[float, float]:
     model.eval()
 
@@ -243,7 +307,10 @@ def eval_epoch(
 
 @torch.no_grad()
 def eval(
-        model: nn.Module, criterion: nn.Module, loader: DataLoader, debug: bool = False,
+    model: nn.Module,
+    criterion: nn.Module,
+    loader: DataLoader,
+    debug: bool = False,
 ) -> tuple[float, float]:
     model.eval()
     return eval_epoch(model, criterion, loader, debug=debug)
@@ -293,7 +360,9 @@ def weight_reset(module: nn.Module) -> None:
         module.reset_parameters()
 
 
-def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) -> tuple[nn.Module, dict]:
+def cv_main(
+    cfg: dict, seed: int, debug: bool = False, profile: bool = False
+) -> tuple[nn.Module, dict]:
     set_seed(seed)
 
     dataset, test_dataset = make_datasets(dataset_name=cfg["dataset_name"])
@@ -320,8 +389,10 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
                 "val_acc": [],
             }
         )
-        
-        model = make_model(model_hp=hp["model"]).to(device, memory_format=torch.channels_last)
+
+        model = make_model(model_hp=hp["model"]).to(
+            device, memory_format=torch.channels_last
+        )
         torch.compile(model, mode="max-autotune")
         optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
 
@@ -329,13 +400,13 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
             model.apply(weight_reset)
 
             train_dataset = dataset.subset(train_idx)
-            train_loader = DataLoader(
+            train_loader = ImageDataLoader(
                 train_dataset,
                 batch_size=hp["batch_size"],
                 shuffle=True,
             )
 
-            val_dataset = dataset.subset(val_idx).transform_(test_transform)
+            val_dataset = dataset.subset(val_idx).transform_data_(test_transform)
             val_loader = DataLoader(val_dataset, batch_size=hp["batch_size"])
 
             train_start = time.time()
@@ -352,13 +423,16 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
             train_end = time.time()
             train_time = train_end - train_start
             val_loss, val_acc = eval(
-                model=model, criterion=criterion, loader=val_loader, debug=debug,
+                model=model,
+                criterion=criterion,
+                loader=val_loader,
+                debug=debug,
             )
             print(
                 f"\t[Fold {fold_idx + 1}/{len(folds)}] {val_loss = :.4f}, {val_acc = :.4f}, {train_time = :.2f}"
             )
             print(
-                    f"\t[Fold {fold_idx + 1}/{len(folds)}] {train_avg_losses=}, {train_accs=}"
+                f"\t[Fold {fold_idx + 1}/{len(folds)}] {train_avg_losses=}, {train_accs=}"
             )
 
             sweep["hps"][-1]["train_avg_losses"].append(train_avg_losses)
@@ -374,9 +448,11 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
     best_hp = sweep["hps"][best_hp_idx]["hp"]
 
     train_dataset = dataset
-    train_loader = DataLoader(train_dataset, batch_size=best_hp["batch_size"], shuffle=True)
+    train_loader = ImageDataLoader(
+        train_dataset, batch_size=best_hp["batch_size"], shuffle=True
+    )
 
-    test_dataset = test_dataset.transform_(test_transform)
+    test_dataset = test_dataset.transform_data_(test_transform)
     test_loader = DataLoader(test_dataset, batch_size=best_hp["batch_size"])
 
     model = make_model(model_hp=best_hp["model"]).to(device)
@@ -392,7 +468,9 @@ def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) ->
         debug=debug,
         profile=profile,
     )
-    test_loss, test_acc = eval(model=model, criterion=criterion, loader=test_loader, debug=debug)
+    test_loss, test_acc = eval(
+        model=model, criterion=criterion, loader=test_loader, debug=debug
+    )
     print(
         f"[Best Model] hp = {best_hp}, test_loss = {test_loss}, test_acc = {test_acc}"
     )
