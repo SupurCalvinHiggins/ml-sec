@@ -115,7 +115,13 @@ def make_profiler(profile: bool):
             with_stack=True,
         )
 
-    class NullProfiler(contextlib.nullcontext):
+    class NullProfiler:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exception_type, exception_value, traceback):
+            pass
+
         def step(self) -> None:
             pass
 

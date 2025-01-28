@@ -32,7 +32,7 @@ class ImageDataset:
             targets.append(target)
 
         data = torch.stack(imgs).to(device)
-        targets = torch.tensor(imgs, device=device)
+        targets = torch.tensor(targets, device=device)
 
         return ImageDataset(data, targets, device=device)
 
