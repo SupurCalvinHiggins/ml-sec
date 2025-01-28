@@ -7,14 +7,15 @@ from torch import optim
 from torch import Tensor
 import torch
 import torchvision
+from torchvision.transforms import v2
 import itertools as it
 import json
 import shutil
 import copy
 import numpy as np
 import random
-import kornia
 import time
+import contextlib
 from pathlib import Path
 
 
@@ -25,6 +26,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("cfg_path", type=Path)
     parser.add_argument("--clean", default=False, action="store_true")
+    parser.add_argument("--debug", default=False, action="store_true")
+    parser.add_argument("--profile", default=False, action="store_true")
     return parser
 
 
@@ -50,7 +53,7 @@ class ImageDataset(Dataset):
         return len(self.data)
 
 
-def make_normalize_transform(dataset_name: str):
+def make_transforms(dataset_name: str):
     dataset_name_to_mean = {
         "cifar-10": (0.4914, 0.4822, 0.4465),
         "cifar-100": (0.5071, 0.4865, 0.4409),
@@ -59,24 +62,21 @@ def make_normalize_transform(dataset_name: str):
         "cifar-10": (0.2471, 0.2435, 0.2616),
         "cifar-100": (0.2673, 0.2564, 0.2762),
     }
-    return kornia.augmentation.Normalize(
-        dataset_name_to_mean[dataset_name],
-        dataset_name_to_std[dataset_name],
-    )
 
-
-def make_transforms(dataset_name: str):
-    normalize_transform = make_normalize_transform(dataset_name)
-    # test_transform = transforms.Compose([transforms.ToTensor(), normalize_transform])
-    # train_transform = transforms.Compose(
-    #     [
-    #       # transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
-    #        # transforms.RandomHorizontalFlip(),
-    #        transforms.ToTensor(),
-    #        normalize_transform,
-    #    ]
-    # )
-    return normalize_transform, normalize_transform
+    test_transform = v2.Compose([
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(
+            dataset_name_to_mean[dataset_name],
+            dataset_name_to_std[dataset_name],
+        )
+    ]) 
+    train_transform = v2.Compose([
+        v2.RandomCrop(32, padding=4, padding_mode="reflect"),
+        v2.RandomHorizontalFlip(),
+        test_transform,
+    ])
+    
+    return train_transform, test_transform 
 
 
 def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
@@ -85,7 +85,7 @@ def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
     train_dataset = cls(root="./data", train=True, download=True)
     test_dataset = cls(root="./data", train=False, download=False)
 
-    transform = transforms.ToTensor()
+    transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.uint8, scale=True)])
 
     train_data, train_targets = zip(*[(transform(img), target) for img, target in train_dataset])
     test_data, test_targets = zip(*[(transform(img), target) for img, target in test_dataset])
@@ -127,37 +127,56 @@ def make_criterion(dataset_name: str) -> nn.Module:
     return cls()
 
 
+@torch.enable_grad()
 def train_epoch(
     model: nn.Module,
     optimizer: optim.Optimizer,
     criterion: nn.Module,
     loader: DataLoader,
+    transform = None,
+    debug: bool = False,
+    profile: bool = False,
 ) -> tuple[float, float]:
+    model.train()
+
     total_loss = torch.tensor(0.0, device=device, requires_grad=False)
     total_correct = torch.tensor(0, device=device, requires_grad=False)
     total_samples = 0
 
-    use_amp = True
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=not debug)
 
-    for x, y in loader:
-        optimizer.zero_grad(set_to_none=True)
+    prof = torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=1, warmup=5, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/resnet18"),
+        record_shapes=True,
+        with_stack=True,
+    ) if profile else contextlib.nullcontext()
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            pred_y = model(x)
-            loss = criterion(pred_y, y)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+    with prof:
+        for x, y in loader:
+            if profile:
+                prof.step()
 
-        loss = loss.detach()
-        pred_y = pred_y.detach()
+            if transform is not None:
+                with torch.no_grad():
+                    x = transform(x)
+                
+            optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss
-        total_correct += (pred_y.argmax(dim=1) == y).sum()
-        total_samples += y.size(0)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=not debug):
+                pred_y = model(x)
+                loss = criterion(pred_y, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-    # return 0.0, 0.0
+            loss = loss.detach()
+            pred_y = pred_y.detach()
+
+            total_loss += loss
+            total_correct += (pred_y.argmax(dim=1) == y).sum()
+            total_samples += y.size(0)
+
     total_loss = total_loss.item()
     total_correct = total_correct.item()
 
@@ -174,42 +193,56 @@ def train(
     criterion: nn.Module,
     loader: DataLoader,
     max_epochs: int,
+    transform = None,
+    debug: bool = False,
+    profile: bool = False,
 ) -> tuple[list[float], list[float]]:
     model.train()
     avg_losses, accs = [], []
     for _ in range(max_epochs):
-        avg_loss, acc = train_epoch(model, optimizer, criterion, loader)
+        avg_loss, acc = train_epoch(model, optimizer, criterion, loader, transform=transform, debug=debug)
         avg_losses.append(avg_loss)
         accs.append(acc)
     return avg_losses, accs
 
 
+@torch.no_grad()
 def eval_epoch(
-    model: nn.Module, criterion: nn.Module, loader: DataLoader
+        model: nn.Module, criterion: nn.Module, loader: DataLoader, debug: bool = False,
 ) -> tuple[float, float]:
-    total_loss = 0.0
-    correct = 0
-    total = 0
+    model.eval()
+
+    total_loss = torch.tensor(0.0, device=device, requires_grad=False)
+    total_correct = torch.tensor(0, device=device, requires_grad=False)
+    total_samples = 0
 
     for x, y in loader:
-        pred_y = model(x)
-        loss = criterion(pred_y, y)
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=not debug):
+            pred_y = model(x)
+            loss = criterion(pred_y, y)
 
-        total_loss += loss.item() * y.size(0)
-        correct += (pred_y.argmax(dim=1) == y).sum().item()
-        total += y.size(0)
+        loss = loss.detach()
+        pred_y = pred_y.detach()
 
-    acc = correct / total
-    avg_loss = total_loss / total
+        total_loss += loss
+        total_correct += (pred_y.argmax(dim=1) == y).sum()
+        total_samples += y.size(0)
+
+    total_loss = total_loss.item()
+    total_correct = total_correct.item()
+
+    acc = total_correct / total_samples
+    avg_loss = total_loss / total_samples
+
     return avg_loss, acc
 
 
 @torch.no_grad()
 def eval(
-    model: nn.Module, criterion: nn.Module, loader: DataLoader
+        model: nn.Module, criterion: nn.Module, loader: DataLoader, debug: bool = False,
 ) -> tuple[float, float]:
     model.eval()
-    return eval_epoch(model, criterion, loader)
+    return eval_epoch(model, criterion, loader, debug=debug)
 
 
 def flatten_dict(d: dict, parent_key: str = "", sep: str = ".") -> dict:
@@ -243,14 +276,21 @@ def make_combinations(hps: dict) -> list[dict]:
     ]
 
 
-def seed(x: int) -> None:
+def set_seed(x: int) -> None:
     torch.manual_seed(x)
     random.seed(x)
     np.random.seed(x)
 
 
-def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
-    seed(cfg["seed"])
+@torch.no_grad()
+def weight_reset(module: nn.Module) -> None:
+    reset_parameters = getattr(module, "reset_parameters", None)
+    if callable(reset_parameters):
+        module.reset_parameters()
+
+
+def cv_main(cfg: dict, seed: int, debug: bool = False, profile: bool = False) -> tuple[nn.Module, dict]:
+    set_seed(seed)
 
     dataset, test_dataset = make_datasets(dataset_name=cfg["dataset_name"])
     train_transform, test_transform = make_transforms(dataset_name=cfg["dataset_name"])
@@ -274,8 +314,14 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
                 "val_acc": [],
             }
         )
+        
+        model = make_model(model_hp=hp["model"]).to(device)
+        optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
+
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
-            train_dataset = dataset.subset(train_idx).transform_(train_transform)
+            model.apply(weight_reset)
+
+            train_dataset = dataset.subset(train_idx)
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=hp["batch_size"],
@@ -284,24 +330,27 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
             val_dataset = dataset.subset(val_idx).transform_(test_transform)
             val_loader = DataLoader(val_dataset, batch_size=hp["batch_size"])
 
-            model = make_model(model_hp=hp["model"]).to(device)
-            optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
-
             train_start = time.time()
             train_avg_losses, train_accs = train(
                 model=model,
                 optimizer=optimizer,
                 criterion=criterion,
                 loader=train_loader,
+                transform=train_transform,
                 max_epochs=hp["max_epochs"],
+                debug=debug,
+                profile=profile,
             )
             train_end = time.time()
             train_time = train_end - train_start
             val_loss, val_acc = eval(
-                model=model, criterion=criterion, loader=val_loader
+                model=model, criterion=criterion, loader=val_loader, debug=debug,
             )
             print(
-                f"\t[Fold {fold_idx + 1}/{len(folds)}] val_loss = {val_loss:.4f}, val_acc = {val_acc:.4f}, time = {train_time:.2f}"
+                f"\t[Fold {fold_idx + 1}/{len(folds)}] {val_loss = :.4f}, {val_acc = :.4f}, {train_time = :.2f}"
+            )
+            print(
+                    f"\t[Fold {fold_idx + 1}/{len(folds)}] {train_avg_losses=}, {train_accs=}"
             )
 
             sweep["hps"][-1]["train_avg_losses"].append(train_avg_losses)
@@ -316,7 +365,7 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
 
     best_hp = sweep["hps"][best_hp_idx]["hp"]
 
-    train_dataset = dataset.transform_(train_transform)
+    train_dataset = dataset
     train_loader = DataLoader(train_dataset, batch_size=best_hp["batch_size"])
 
     test_dataset = test_dataset.transform_(test_transform)
@@ -331,8 +380,11 @@ def cv_main(cfg: dict) -> tuple[nn.Module, dict]:
         criterion=criterion,
         loader=train_loader,
         max_epochs=best_hp["max_epochs"],
+        transform=train_transform,
+        debug=debug,
+        profile=profile,
     )
-    test_loss, test_acc = eval(model=model, criterion=criterion, loader=test_loader)
+    test_loss, test_acc = eval(model=model, criterion=criterion, loader=test_loader, debug=debug)
     print(
         f"[Best Model] hp = {best_hp}, test_loss = {test_loss}, test_acc = {test_acc}"
     )
@@ -363,13 +415,15 @@ def main():
     result_path.mkdir()
 
     cfg = json.loads(args.cfg_path.read_text())
-    model, sweep = cv_main(cfg)
+    seeds = cfg.pop("seeds")
+    for seed in seeds:
+        model, sweep = cv_main(cfg, seed=seed, debug=args.debug, profile=args.profile)
 
-    model_path = result_path / "model.pth"
-    sweep_path = result_path / "sweep.json"
+        model_path = result_path / f"model-{seed}.pth"
+        sweep_path = result_path / f"sweep-{seed}.json"
 
-    torch.save(model.state_dict(), model_path)
-    sweep_path.write_text(json.dumps(sweep))
+        torch.save(model.state_dict(), model_path)
+        sweep_path.write_text(json.dumps(sweep))
 
 
 if __name__ == "__main__":
