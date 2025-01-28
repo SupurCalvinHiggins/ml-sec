@@ -1,11 +1,8 @@
 import argparse
-import math
 from sklearn.model_selection import StratifiedKFold
-from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets
-from torch import nn
+from torch import channels_last, memory_format, nn
 from torch import optim
-from torch import Tensor
 import torch
 import torchvision
 from torchvision.transforms import v2
@@ -18,6 +15,7 @@ import random
 import time
 import contextlib
 from pathlib import Path
+from data import ImageDataLoader, ImageDataset
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -30,66 +28,6 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", default=False, action="store_true")
     parser.add_argument("--profile", default=False, action="store_true")
     return parser
-
-
-class ImageDataset(Dataset):
-    def __init__(self, data, targets, device=None):
-        self.data = data.to(device)
-        self.targets = targets.to(device)
-        self.device = device
-
-    def subset(self, indices: list[int]):
-        data, targets = self.data[indices], self.targets[indices]
-        return ImageDataset(data, targets, device=self.device)
-
-    def slice(self, start: int, end: int):
-        imgs, targets = self.data[start:end], self.targets[start:end]
-        return imgs, targets
-
-    def transform_(self, transform):
-        self.data, self.targets = transform(self.data, self.targets)
-        return self
-
-    def transform_data_(self, transform):
-        self.data = transform(self.data)
-        return self
-
-    def __getitem__(self, index: int):
-        img, target = self.data[index], self.targets[index]
-        return img, target
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-
-class ImageDataLoader:
-    def __init__(self, dataset: ImageDataset, batch_size: int, shuffle: bool = False):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-
-        self._idx = 0
-
-    def __iter__(self):
-        self._idx = 0
-
-        if self.shuffle:
-
-            @torch.no_grad()
-            def shuffle_transform(data, targets):
-                idx = torch.randperm(len(data), device=data.device)
-                return data[idx], targets[idx]
-
-            self.dataset.transform_(shuffle_transform)
-
-        return self
-
-    def __next__(self):
-        if self._idx >= len(self.dataset):
-            raise StopIteration
-        imgs, targets = self.dataset.slice(self._idx, self._idx + self.batch_size)
-        self._idx += self.batch_size
-        return imgs, targets
 
 
 def make_transforms(dataset_name: str):
@@ -125,33 +63,26 @@ def make_transforms(dataset_name: str):
 def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
     dataset_name_to_cls = {"cifar-10": datasets.CIFAR10, "cifar-100": datasets.CIFAR100}
     cls = dataset_name_to_cls[dataset_name]
+
     train_dataset = cls(root="./data", train=True, download=True)
     test_dataset = cls(root="./data", train=False, download=False)
 
-    transform = v2.Compose([v2.ToImage(), v2.ToDtype(torch.uint8, scale=True)])
-
-    train_data, train_targets = zip(
-        *[(transform(img), target) for img, target in train_dataset]
-    )
-    test_data, test_targets = zip(
-        *[(transform(img), target) for img, target in test_dataset]
-    )
-
-    train_data, train_targets = torch.stack(train_data), torch.tensor(train_targets)
-    test_data, test_targets = torch.stack(test_data), torch.tensor(test_targets)
-
-    train_dataset = ImageDataset(train_data, train_targets, device=device)
-    test_dataset = ImageDataset(test_data, test_targets, device=device)
+    train_dataset = ImageDataset.from_dataset(train_dataset, device=device)
+    test_dataset = ImageDataset.from_dataset(test_dataset, device=device)
 
     return train_dataset, test_dataset
 
 
-def make_model(model_hp: dict) -> nn.Module:
+def make_model(model_hp: dict, debug: bool = False) -> nn.Module:
     model_hp = copy.deepcopy(model_hp)
     name = model_hp.pop("name")
     name_to_cls = {"resnet-18": torchvision.models.resnet18}
     cls = name_to_cls[name]
-    return cls(**model_hp)
+    model = cls(**model_hp).to(device)
+    if not debug:
+        model.to(memory_format=torch.channels_last)
+        torch.compile(model, mode="max-autotune")
+    return model
 
 
 def make_optimizer(model: nn.Module, optimizer_hp: dict) -> optim.Optimizer:
@@ -171,7 +102,24 @@ def make_criterion(dataset_name: str) -> nn.Module:
         "cifar-100": nn.CrossEntropyLoss,
     }
     cls = dataset_name_to_cls[dataset_name]
-    return cls()
+    return cls().to(device)
+
+
+def make_profiler(profile: bool):
+    if profile:
+        return torch.profiler.profile(
+            schedule=torch.profiler.schedule(wait=5, warmup=5, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                f"./.log/{time.time()}"
+            ),
+            with_stack=True,
+        )
+
+    class NullProfiler(contextlib.nullcontext):
+        def step(self) -> None:
+            pass
+
+    return NullProfiler()
 
 
 @torch.enable_grad()
@@ -179,8 +127,7 @@ def train_epoch(
     model: nn.Module,
     optimizer: optim.Optimizer,
     criterion: nn.Module,
-    loader: DataLoader,
-    transform=None,
+    loader: ImageDataLoader,
     debug: bool = False,
     profile: bool = False,
 ) -> tuple[float, float]:
@@ -192,25 +139,9 @@ def train_epoch(
 
     scaler = torch.amp.GradScaler("cuda", enabled=not debug)
 
-    prof = (
-        torch.profiler.profile(
-            schedule=torch.profiler.schedule(wait=5, warmup=5, active=3, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/resnet18"),
-            with_stack=True,
-        )
-        if profile
-        else contextlib.nullcontext()
-    )
-
-    with prof:
+    with make_profiler(profile) as profiler:
         for x, y in loader:
-            if profile:
-                prof.step()
-
-            if transform is not None:
-                with torch.no_grad():
-                    x = transform(x)
-            x = x.to(memory_format=torch.channels_last)
+            profiler.step()
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -244,9 +175,8 @@ def train(
     model: nn.Module,
     optimizer: optim.Optimizer,
     criterion: nn.Module,
-    loader: DataLoader,
+    loader: ImageDataLoader,
     max_epochs: int,
-    transform=None,
     debug: bool = False,
     profile: bool = False,
 ) -> tuple[list[float], list[float]]:
@@ -258,7 +188,6 @@ def train(
             optimizer,
             criterion,
             loader,
-            transform=transform,
             debug=debug,
             profile=profile,
         )
@@ -271,7 +200,7 @@ def train(
 def eval_epoch(
     model: nn.Module,
     criterion: nn.Module,
-    loader: DataLoader,
+    loader: ImageDataLoader,
     debug: bool = False,
 ) -> tuple[float, float]:
     model.eval()
@@ -281,7 +210,6 @@ def eval_epoch(
     total_samples = 0
 
     for x, y in loader:
-        x = x.to(memory_format=torch.channels_last)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=not debug):
             pred_y = model(x)
             loss = criterion(pred_y, y)
@@ -306,7 +234,7 @@ def eval_epoch(
 def eval(
     model: nn.Module,
     criterion: nn.Module,
-    loader: DataLoader,
+    loader: ImageDataLoader,
     debug: bool = False,
 ) -> tuple[float, float]:
     model.eval()
@@ -364,13 +292,14 @@ def cv_main(
 
     dataset, test_dataset = make_datasets(dataset_name=cfg["dataset_name"])
     train_transform, test_transform = make_transforms(dataset_name=cfg["dataset_name"])
-    criterion = make_criterion(dataset_name=cfg["dataset_name"]).to(device)
+    criterion = make_criterion(dataset_name=cfg["dataset_name"])
 
     kfold = StratifiedKFold(n_splits=cfg["n_splits"], shuffle=True)
     idx = list(range(len(dataset)))
     folds = list(kfold.split(idx, dataset.targets.cpu()))
 
-    torch.backends.cudnn.benchmark = True
+    if not debug:
+        torch.backends.cudnn.benchmark = True
 
     hps = make_combinations(cfg["hps"])
     sweep = {"hps": [], "best_hp": {}}
@@ -387,10 +316,7 @@ def cv_main(
             }
         )
 
-        model = make_model(model_hp=hp["model"]).to(
-            device, memory_format=torch.channels_last
-        )
-        torch.compile(model, mode="max-autotune")
+        model = make_model(model_hp=hp["model"], debug=debug)
         optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
@@ -401,10 +327,16 @@ def cv_main(
                 train_dataset,
                 batch_size=hp["batch_size"],
                 shuffle=True,
+                transform=train_transform,
+                channels_last=not debug,
             )
 
-            val_dataset = dataset.subset(val_idx).transform_data_(test_transform)
-            val_loader = DataLoader(val_dataset, batch_size=hp["batch_size"])
+            val_dataset = dataset.subset(val_idx).transform_(test_transform)
+            val_loader = ImageDataLoader(
+                val_dataset,
+                batch_size=hp["batch_size"],
+                channels_last=not debug,
+            )
 
             train_start = time.time()
             train_avg_losses, train_accs = train(
@@ -412,7 +344,6 @@ def cv_main(
                 optimizer=optimizer,
                 criterion=criterion,
                 loader=train_loader,
-                transform=train_transform,
                 max_epochs=hp["max_epochs"],
                 debug=debug,
                 profile=profile,
@@ -446,13 +377,21 @@ def cv_main(
 
     train_dataset = dataset
     train_loader = ImageDataLoader(
-        train_dataset, batch_size=best_hp["batch_size"], shuffle=True
+        train_dataset,
+        batch_size=best_hp["batch_size"],
+        shuffle=True,
+        transform=train_transform,
+        channels_last=not debug,
     )
 
-    test_dataset = test_dataset.transform_data_(test_transform)
-    test_loader = DataLoader(test_dataset, batch_size=best_hp["batch_size"])
+    test_dataset = test_dataset.transform_(test_transform)
+    test_loader = ImageDataLoader(
+        test_dataset,
+        batch_size=best_hp["batch_size"],
+        channels_last=not debug,
+    )
 
-    model = make_model(model_hp=best_hp["model"]).to(device)
+    model = make_model(model_hp=best_hp["model"])
     optimizer = make_optimizer(model, optimizer_hp=best_hp["optimizer"])
 
     train_avg_losses, train_accs = train(
@@ -461,7 +400,6 @@ def cv_main(
         criterion=criterion,
         loader=train_loader,
         max_epochs=best_hp["max_epochs"],
-        transform=train_transform,
         debug=debug,
         profile=profile,
     )
