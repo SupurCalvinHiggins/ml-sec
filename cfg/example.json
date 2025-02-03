@@ -7,11 +7,16 @@
       "name": ["resnet-18"]
     },
     "optimizer": {
-      "name": ["sgd"],
-      "lr": [0.01],
-      "weight_decay": [0.001]
+      "name": ["adamw"],
+      "weight_decay": [0.1, 0.01]
     },
-    "max_epochs": [10],
-    "batch_size": [4096]
+    "scheduler": {
+	"max_lr": [0.1, 0.01, 0.001]
+    },
+    "criterion": {
+        "label_smoothing": [0.1, 0.2, 0.3]
+    },
+    "max_epochs": [20],
+    "batch_size": [128, 1024, 8192]
   }
 }

@@ -73,19 +73,27 @@ def make_datasets(dataset_name: str) -> tuple[ImageDataset, ImageDataset]:
     return train_dataset, test_dataset
 
 
-def make_model(model_hp: dict, debug: bool = False) -> nn.Module:
+def make_model(dataset_name: str, model_hp: dict, debug: bool = False) -> nn.Module:
     model_hp = copy.deepcopy(model_hp)
+
+    dataset_name_to_num_classes = {"cifar-10": 10, "cifar-100": 100}
+    num_classes = dataset_name_to_num_classes[dataset_name]
+
     name = model_hp.pop("name")
     name_to_cls = {"resnet-18": torchvision.models.resnet18}
     cls = name_to_cls[name]
-    model = cls(**model_hp).to(device)
+    model = cls(**model_hp, num_classes=num_classes)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model = model.to(device)
+
     if not debug:
         model.to(memory_format=torch.channels_last)
         torch.compile(model, mode="max-autotune")
+
     return model
 
 
-def make_optimizer(model: nn.Module, optimizer_hp: dict) -> optim.Optimizer:
+def make_optimizer(model: nn.Module, max_lr: float, optimizer_hp: dict, debug: bool = False) -> optim.Optimizer:
     optimizer_hp = copy.deepcopy(optimizer_hp)
     name = optimizer_hp.pop("name")
     name_to_cls = {
@@ -93,16 +101,20 @@ def make_optimizer(model: nn.Module, optimizer_hp: dict) -> optim.Optimizer:
         "adamw": optim.AdamW,
     }
     cls = name_to_cls[name]
-    return cls(model.parameters(), **optimizer_hp)
+    return cls(model.parameters(), lr=max_lr / 10, fused=not debug, **optimizer_hp)
 
 
-def make_criterion(dataset_name: str) -> nn.Module:
+def make_scheduler(optimizer: optim.Optimizer, steps_per_epoch: int, epochs: int, scheduler_hp: dict) -> optim.lr_scheduler.OneCycleLR:
+    return optim.lr_scheduler.OneCycleLR(optimizer, steps_per_epoch=steps_per_epoch, epochs=epochs, **scheduler_hp)
+
+
+def make_criterion(dataset_name: str, criterion_hp: dict) -> nn.Module:
     dataset_name_to_cls = {
         "cifar-10": nn.CrossEntropyLoss,
         "cifar-100": nn.CrossEntropyLoss,
     }
     cls = dataset_name_to_cls[dataset_name]
-    return cls().to(device)
+    return cls(**criterion_hp).to(device)
 
 
 def make_profiler(profile: bool):
@@ -132,6 +144,7 @@ def make_profiler(profile: bool):
 def train_epoch(
     model: nn.Module,
     optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.OneCycleLR,
     criterion: nn.Module,
     loader: ImageDataLoader,
     debug: bool = False,
@@ -158,6 +171,7 @@ def train_epoch(
                 loss = criterion(pred_y, y)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
+            scheduler.step()
             scaler.update()
 
             loss = loss.detach()
@@ -180,6 +194,7 @@ def train_epoch(
 def train(
     model: nn.Module,
     optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.OneCycleLR,
     criterion: nn.Module,
     loader: ImageDataLoader,
     max_epochs: int,
@@ -192,6 +207,7 @@ def train(
         avg_loss, acc = train_epoch(
             model,
             optimizer,
+            scheduler,
             criterion,
             loader,
             debug=debug,
@@ -298,7 +314,6 @@ def cv_main(
 
     dataset, test_dataset = make_datasets(dataset_name=cfg["dataset_name"])
     train_transform, test_transform = make_transforms(dataset_name=cfg["dataset_name"])
-    criterion = make_criterion(dataset_name=cfg["dataset_name"])
 
     kfold = StratifiedKFold(n_splits=cfg["n_splits"], shuffle=True)
     idx = list(range(len(dataset)))
@@ -322,11 +337,12 @@ def cv_main(
             }
         )
 
-        model = make_model(model_hp=hp["model"], debug=debug)
-        optimizer = make_optimizer(model, optimizer_hp=hp["optimizer"])
+        model = make_model(dataset_name=cfg["dataset_name"], model_hp=hp["model"], debug=debug)
+        criterion = make_criterion(dataset_name=cfg["dataset_name"], criterion_hp=hp["criterion"])
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
             model.apply(weight_reset)
+            optimizer = make_optimizer(model, max_lr=hp["scheduler"]["max_lr"], optimizer_hp=hp["optimizer"], debug=debug)
 
             train_dataset = dataset.subset(train_idx)
             train_loader = ImageDataLoader(
@@ -336,6 +352,8 @@ def cv_main(
                 transform=train_transform,
                 channels_last=not debug,
             )
+
+            scheduler = make_scheduler(optimizer, steps_per_epoch=len(train_loader), epochs=hp["max_epochs"], scheduler_hp=hp["scheduler"])
 
             val_dataset = dataset.subset(val_idx).transform_(test_transform)
             val_loader = ImageDataLoader(
@@ -348,6 +366,7 @@ def cv_main(
             train_avg_losses, train_accs = train(
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 criterion=criterion,
                 loader=train_loader,
                 max_epochs=hp["max_epochs"],
@@ -390,6 +409,8 @@ def cv_main(
         channels_last=not debug,
     )
 
+    scheduler = make_scheduler(optimizer, steps_per_epoch=len(train_loader), epochs=best_hp["max_epochs"], scheduler_hp=best_hp["scheduler"])
+
     test_dataset = test_dataset.transform_(test_transform)
     test_loader = ImageDataLoader(
         test_dataset,
@@ -397,12 +418,15 @@ def cv_main(
         channels_last=not debug,
     )
 
-    model = make_model(model_hp=best_hp["model"])
-    optimizer = make_optimizer(model, optimizer_hp=best_hp["optimizer"])
+    criterion = make_criterion(dataset_name=cfg["dataset_name"], criterion_hp=best_hp["criterion"])
+
+    model = make_model(dataset_name=cfg["dataset_name"], model_hp=best_hp["model"], debug=debug)
+    optimizer = make_optimizer(model, max_lr=best_hp["scheduler"]["max_lr"], optimizer_hp=best_hp["optimizer"], debug=debug)
 
     train_avg_losses, train_accs = train(
         model=model,
         optimizer=optimizer,
+        scheduler=scheduler,
         criterion=criterion,
         loader=train_loader,
         max_epochs=best_hp["max_epochs"],

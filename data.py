@@ -74,6 +74,13 @@ class ImageDataLoader:
 
         self._idx = 0
 
+    def __len__(self) -> int:
+        left = len(self.dataset) - self._idx
+        batches = left // self.batch_size
+        if left % self.batch_size != 0:
+            batches += 1
+        return batches
+
     def __iter__(self):
         self._idx = 0
 
